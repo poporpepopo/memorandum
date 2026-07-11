@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Meeting logs generated at runtime
+meeting_log_*.txt

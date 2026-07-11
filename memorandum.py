@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""memorandum: 完全ローカルで動作する会議リアルタイム要約アシスタント。
+
+Web 会議の再生音声 (スピーカー出力のループバック) またはマイク音声を
+一定間隔で録音し、Whisper によるローカル文字起こしと
+Ollama (ローカル LLM) による要約をパイプラインで実行する。
+要約はターミナル表示とデスクトップ通知の両方で確認でき、
+終了時 (Ctrl+C) には会議全体の最終要約と全原文をファイルへ保存する。
+
+音声データ・テキストデータは一切外部サーバーへ送信されない。
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import queue
+import re
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterator, Protocol
+
+import numpy as np
+import ollama
+import speech_recognition as sr
+import whisper
+from plyer import notification
+
+logger = logging.getLogger("memorandum")
+
+# Whisper が無音時に出力しがちな定型ハルシネーション
+KNOWN_HALLUCINATIONS = (
+    "スタッフの方が",
+    "ご視聴ありがとうございました",
+    "チャンネル登録",
+)
+MIN_TRANSCRIPT_CHARS = 5
+
+
+@dataclass(frozen=True)
+class Config:
+    """実行時設定。CLI 引数から生成する。"""
+
+    llm_model: str = "gemma4:e4b"
+    whisper_model: str = "small"
+    language: str = "ja"
+    # "system" (スピーカー出力) or "mic" (マイク)。
+    # ループバック録音は WASAPI 依存のため Windows 以外はマイクを既定とする
+    source: str = "system" if sys.platform == "win32" else "mic"
+    chunk_seconds: int = 60
+    sample_rate: int = 16000
+    rms_threshold: float = 0.005
+    output_dir: Path = Path(".")
+    notify: bool = True
+
+
+@dataclass(frozen=True)
+class AudioChunk:
+    """1 サイクル分の録音データ (float32, -1.0〜1.0)。"""
+
+    recorded_at: datetime
+    samples: np.ndarray
+
+
+@dataclass(frozen=True)
+class TranscriptChunk:
+    """1 サイクル分の文字起こし結果。"""
+
+    recorded_at: datetime
+    text: str
+
+
+def rms(samples: np.ndarray) -> float:
+    """音圧 (Root Mean Square) を返す。無音チャンクの足切りに使う。"""
+    return float(np.sqrt(np.mean(np.square(samples))))
+
+
+def resample(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """線形補間による簡易リサンプリング。音声認識用途では十分な品質。"""
+    if src_rate == dst_rate:
+        return samples
+    n_dst = int(len(samples) * dst_rate / src_rate)
+    positions = np.linspace(0, len(samples) - 1, n_dst)
+    return np.interp(positions, np.arange(len(samples)), samples).astype(np.float32)
+
+
+class AudioSource(Protocol):
+    """音声チャンクの供給元 (マイク / スピーカーループバック) の共通インターフェース。"""
+
+    def chunks(self) -> Iterator[AudioChunk]: ...
+
+
+class SystemAudioCapture:
+    """スピーカーへ再生中の音声 (システム音声) を録音する。
+
+    Windows の WASAPI ループバックを利用し、Web 会議など
+    相手の声がスピーカー側に流れるケースの議事録に使う。
+    """
+
+    _FRAMES_PER_BUFFER = 1024
+
+    def __init__(self, config: Config) -> None:
+        if sys.platform != "win32":
+            raise SystemExit(
+                "--source system は Windows (WASAPI ループバック) のみ対応です。"
+                "macOS では --source mic と BlackHole 等の仮想デバイスを併用してください。"
+            )
+        self._config = config
+
+    def chunks(self) -> Iterator[AudioChunk]:
+        import pyaudiowpatch as pyaudio  # Windows 専用のため遅延 import
+
+        audio = pyaudio.PyAudio()
+        try:
+            device = self._default_loopback(audio)
+            rate = int(device["defaultSampleRate"])
+            channels = int(device["maxInputChannels"])
+            logger.info(
+                "ループバック録音: %s (%d Hz, %d ch)", device["name"], rate, channels
+            )
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=rate,
+                input=True,
+                input_device_index=int(device["index"]),
+                frames_per_buffer=self._FRAMES_PER_BUFFER,
+            )
+            try:
+                reads_per_chunk = max(
+                    1,
+                    round(rate * self._config.chunk_seconds / self._FRAMES_PER_BUFFER),
+                )
+                while True:
+                    logger.info("録音中 (%d 秒)...", self._config.chunk_seconds)
+                    recorded_at = datetime.now()
+                    frames = [
+                        stream.read(self._FRAMES_PER_BUFFER, exception_on_overflow=False)
+                        for _ in range(reads_per_chunk)
+                    ]
+                    yield AudioChunk(
+                        recorded_at,
+                        self._to_whisper_waveform(b"".join(frames), rate, channels),
+                    )
+            finally:
+                stream.stop_stream()
+                stream.close()
+        finally:
+            audio.terminate()
+
+    @staticmethod
+    def _default_loopback(audio) -> dict:
+        """既定の再生デバイスに対応するループバックデバイスを返す。"""
+        try:
+            return audio.get_default_wasapi_loopback()
+        except (OSError, LookupError) as exc:
+            raise SystemExit(
+                "ループバック録音デバイスが見つかりません。"
+                "既定の再生デバイスが有効か確認してください。"
+            ) from exc
+
+    def _to_whisper_waveform(
+        self, data: bytes, rate: int, channels: int
+    ) -> np.ndarray:
+        """int16 の生データを Whisper が扱えるモノラル float32 波形へ変換する。"""
+        samples = np.frombuffer(data, np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            samples = samples.reshape(-1, channels).mean(axis=1)
+        return resample(samples, rate, self._config.sample_rate)
+
+
+class MicrophoneCapture:
+    """マイクから固定長の音声チャンクを読み続ける (対面会議向け)。"""
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._recognizer = sr.Recognizer()
+        # 沈黙で録音を打ち切らず、chunk_seconds の固定長バッチとして扱う
+        self._recognizer.pause_threshold = config.chunk_seconds
+
+    def chunks(self) -> Iterator[AudioChunk]:
+        """録音した音声チャンクを無限に yield する。"""
+        with sr.Microphone(sample_rate=self._config.sample_rate) as source:
+            logger.info("環境ノイズを計測中...")
+            self._recognizer.adjust_for_ambient_noise(source, duration=1)
+            while True:
+                logger.info("録音中 (最大 %d 秒)...", self._config.chunk_seconds)
+                audio = self._recognizer.listen(
+                    source,
+                    timeout=None,
+                    phrase_time_limit=self._config.chunk_seconds,
+                )
+                yield AudioChunk(
+                    recorded_at=datetime.now(),
+                    samples=self._to_float_array(audio),
+                )
+
+    @staticmethod
+    def _to_float_array(audio: sr.AudioData) -> np.ndarray:
+        """Whisper が直接扱える float32 波形へ変換する。"""
+        samples = np.frombuffer(audio.get_raw_data(), np.int16)
+        return samples.astype(np.float32) / 32768.0
+
+
+class Transcriber:
+    """Whisper によるローカル文字起こし。"""
+
+    def __init__(self, model_name: str, language: str) -> None:
+        logger.info("Whisper モデル (%s) をロード中...", model_name)
+        self._model = whisper.load_model(model_name)
+        self._language = language
+
+    def transcribe(self, samples: np.ndarray) -> str:
+        """音声をテキスト化する。無音・ハルシネーションと判定したら空文字を返す。"""
+        result = self._model.transcribe(
+            samples,
+            language=self._language,
+            fp16=False,
+            no_speech_threshold=0.6,  # 無音とみなすセグメントを破棄
+            logprob_threshold=-1.0,  # 確信度の低い出力を破棄
+        )
+        text = str(result["text"]).strip()
+        return "" if self._is_hallucination(text) else text
+
+    @staticmethod
+    def _is_hallucination(text: str) -> bool:
+        """無音時に Whisper が出力しがちな定型文・短い断片を除外する。"""
+        if len(text) < MIN_TRANSCRIPT_CHARS:
+            return True
+        return any(phrase in text for phrase in KNOWN_HALLUCINATIONS)
+
+
+class Summarizer:
+    """Ollama (ローカル LLM) による要約生成。"""
+
+    CHUNK_PROMPT = (
+        "以下は会議での直近の発言です。記号や見出しを使わず、"
+        "日本語30文字以内の一文で要約してください。\n\n{text}"
+    )
+    FINAL_PROMPT = (
+        "あなたはプロの書記です。以下の会議の全発言記録から、"
+        "重要な論点・決定事項・ネクストアクションを整理した"
+        "議事録要約を日本語で作成してください。\n\n{text}"
+    )
+
+    def __init__(self, model: str) -> None:
+        self._model = model
+
+    def summarize_chunk(self, text: str) -> str:
+        summary = self._chat(self.CHUNK_PROMPT.format(text=text))
+        # 通知バナーに Markdown 記号が混ざらないよう除去する
+        return re.sub(r"[#*`]", "", summary).strip()
+
+    def summarize_meeting(self, text: str) -> str:
+        return self._chat(self.FINAL_PROMPT.format(text=text))
+
+    def _chat(self, prompt: str) -> str:
+        response = ollama.chat(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response["message"]["content"].strip()
+
+
+class Notifier:
+    """デスクトップ通知。通知に失敗しても本体の処理は止めない。"""
+
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+
+    def send(self, title: str, message: str) -> None:
+        if not self._enabled:
+            return
+        try:
+            notification.notify(
+                title=title,
+                message=message,
+                app_name="memorandum",
+                timeout=6,
+            )
+        except Exception:
+            logger.warning("デスクトップ通知に失敗しました", exc_info=True)
+
+
+def save_report(
+    chunks: list[TranscriptChunk], final_summary: str, output_dir: Path
+) -> Path:
+    """最終要約とタイムスタンプ付き全原文をテキストファイルへ保存する。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"meeting_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    lines = ["=== 会議最終要約 ===", final_summary, "", "=== 全原文データ ==="]
+    lines += [f"[{c.recorded_at:%H:%M:%S}] {c.text}" for c in chunks]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+class MeetingAssistant:
+    """録音と AI 処理を並行実行するオーケストレーター。
+
+    録音 (メインスレッド) と文字起こし・要約 (ワーカースレッド) を
+    キューで分離し、AI 処理に時間がかかっても録音が途切れないようにする。
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        capture: AudioSource,
+        transcriber: Transcriber,
+        summarizer: Summarizer,
+        notifier: Notifier,
+    ) -> None:
+        self._config = config
+        self._capture = capture
+        self._transcriber = transcriber
+        self._summarizer = summarizer
+        self._notifier = notifier
+        self._audio_queue: queue.Queue[AudioChunk | None] = queue.Queue()
+        self._chunks: list[TranscriptChunk] = []
+
+    def run(self) -> None:
+        worker = threading.Thread(
+            target=self._process_loop, name="processor", daemon=True
+        )
+        worker.start()
+        try:
+            self._capture_loop()
+        except KeyboardInterrupt:
+            print("\n⏹ 会議を終了します。未処理の音声を処理中...")
+        finally:
+            self._audio_queue.put(None)  # ワーカーへの終了シグナル
+            worker.join()
+            self._finalize()
+
+    def _capture_loop(self) -> None:
+        for chunk in self._capture.chunks():
+            level = rms(chunk.samples)
+            if level < self._config.rms_threshold:
+                logger.info("無音のためスキップ (RMS=%.4f)", level)
+                continue
+            self._audio_queue.put(chunk)
+
+    def _process_loop(self) -> None:
+        while True:
+            chunk = self._audio_queue.get()
+            if chunk is None:
+                return
+            try:
+                self._process_chunk(chunk)
+            except Exception:
+                logger.exception("音声チャンクの処理に失敗しました")
+
+    def _process_chunk(self, chunk: AudioChunk) -> None:
+        text = self._transcriber.transcribe(chunk.samples)
+        if not text:
+            return
+        print(f"\n--- 原文 [{chunk.recorded_at:%H:%M:%S}] ---\n{text}")
+        self._chunks.append(TranscriptChunk(chunk.recorded_at, text))
+
+        summary = self._summarizer.summarize_chunk(text)
+        print(f"💡 要約: {summary}")
+        self._notifier.send("✨ 直近の要約", summary)
+
+    def _finalize(self) -> None:
+        if not self._chunks:
+            print("録音データがないため保存をスキップしました。")
+            return
+        full_text = "\n".join(c.text for c in self._chunks)
+        try:
+            final_summary = self._summarizer.summarize_meeting(full_text)
+        except Exception:
+            logger.exception("最終要約の生成に失敗しました。原文のみ保存します。")
+            final_summary = "(最終要約の生成に失敗しました)"
+
+        print("\n" + "=" * 30)
+        print("📝 【最終要約】")
+        print(final_summary)
+        print("=" * 30)
+
+        path = save_report(self._chunks, final_summary, self._config.output_dir)
+        print(f"📄 議事録を保存しました: {path}")
+        self._notifier.send("✅ 保存完了", f"議事録を保存しました: {path.name}")
+
+
+def ensure_ollama_ready(model: str) -> None:
+    """起動時に Ollama サーバーへの接続とモデルの存在を確認する。"""
+    try:
+        ollama.show(model)
+    except ollama.ResponseError as exc:
+        raise SystemExit(
+            f"Ollama にモデル '{model}' が見つかりません。"
+            f"`ollama pull {model}` を実行してください。({exc.error})"
+        ) from exc
+    except Exception as exc:
+        raise SystemExit(
+            "Ollama サーバーに接続できません。"
+            "Ollama を起動してから再実行してください。"
+        ) from exc
+
+
+def parse_args(argv: list[str] | None = None) -> Config:
+    defaults = Config()
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=defaults.llm_model,
+        help=f"要約に使う Ollama モデル (default: {defaults.llm_model})",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default=defaults.whisper_model,
+        help=f"Whisper モデルサイズ (default: {defaults.whisper_model})",
+    )
+    parser.add_argument(
+        "--language",
+        default=defaults.language,
+        help=f"文字起こしの言語コード (default: {defaults.language})",
+    )
+    parser.add_argument(
+        "--source",
+        choices=("system", "mic"),
+        default=defaults.source,
+        help=(
+            "録音する音源。system: スピーカー出力のループバック (Web会議向け) / "
+            f"mic: マイク (対面向け) (default: {defaults.source})"
+        ),
+    )
+    parser.add_argument(
+        "--chunk-seconds",
+        type=int,
+        default=defaults.chunk_seconds,
+        help=f"1 サイクルの録音秒数 (default: {defaults.chunk_seconds})",
+    )
+    parser.add_argument(
+        "--rms-threshold",
+        type=float,
+        default=defaults.rms_threshold,
+        help=f"無音とみなす音圧しきい値 (default: {defaults.rms_threshold})",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=defaults.output_dir,
+        help="議事録の保存先ディレクトリ (default: カレントディレクトリ)",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="デスクトップ通知を無効にする",
+    )
+    args = parser.parse_args(argv)
+    return Config(
+        llm_model=args.llm_model,
+        whisper_model=args.whisper_model,
+        language=args.language,
+        source=args.source,
+        chunk_seconds=args.chunk_seconds,
+        rms_threshold=args.rms_threshold,
+        output_dir=args.output_dir,
+        notify=not args.no_notify,
+    )
+
+
+def configure_output_encoding() -> None:
+    """Windows でリダイレクト時に stdout が cp932 になり、絵文字や日本語の
+    出力が UnicodeEncodeError で落ちるのを防ぐ。"""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def main(argv: list[str] | None = None) -> None:
+    configure_output_encoding()
+    config = parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    ensure_ollama_ready(config.llm_model)
+    capture: AudioSource = (
+        SystemAudioCapture(config)
+        if config.source == "system"
+        else MicrophoneCapture(config)
+    )
+    assistant = MeetingAssistant(
+        config,
+        capture=capture,
+        transcriber=Transcriber(config.whisper_model, config.language),
+        summarizer=Summarizer(config.llm_model),
+        notifier=Notifier(config.notify),
+    )
+    source_label = (
+        "スピーカー出力 (Web会議)" if config.source == "system" else "マイク"
+    )
+    print("🚀 完全ローカル・会議アシスタント稼働中")
+    print(f"   入力: {source_label}")
+    print(f"   STT: Whisper ({config.whisper_model}) / LLM: {config.llm_model}")
+    print("   【Ctrl+C】で終了し、最終レポートを作成します。")
+    assistant.run()
+
+
+if __name__ == "__main__":
+    main()
