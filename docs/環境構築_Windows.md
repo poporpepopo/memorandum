@@ -26,7 +26,7 @@ ollama pull gemma4:e4b
 
 macOS と違い、PyAudio は pip のビルド済みパッケージがそのまま入るため
 `portaudio` の別途インストールは不要です。
-デスクトップ通知に必要な `pywin32` と、スピーカー音声の録音
+デスクトップ通知（トースト）に必要な `winotify` と、スピーカー音声の録音
 （WASAPI ループバック）に必要な `PyAudioWPatch` は、`requirements.txt` の
 環境マーカーにより Windows でのみ自動インストールされます。
 

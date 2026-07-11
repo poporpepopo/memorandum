@@ -28,7 +28,6 @@ import numpy as np
 import ollama
 import speech_recognition as sr
 import whisper
-from plyer import notification
 
 logger = logging.getLogger("memorandum")
 
@@ -102,6 +101,8 @@ class SystemAudioCapture:
     """
 
     _FRAMES_PER_BUFFER = 1024
+    _MAX_CONSECUTIVE_ERRORS = 5
+    _RETRY_WAIT_SECONDS = 2.0
 
     def __init__(self, config: Config) -> None:
         if sys.platform != "win32":
@@ -112,9 +113,39 @@ class SystemAudioCapture:
         self._config = config
 
     def chunks(self) -> Iterator[AudioChunk]:
+        """録音チャンクを無限に yield する。
+
+        モニタのスリープや再生デバイスの切替でループバックストリームが
+        失効した場合は、最新の既定デバイスを取り直して自動再接続する。
+        """
+        consecutive_errors = 0
+        while True:
+            try:
+                for chunk in self._record_session():
+                    consecutive_errors = 0
+                    yield chunk
+            except OSError as exc:
+                consecutive_errors += 1
+                if consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                    raise SystemExit(
+                        f"録音デバイスのエラーが解消しないため終了します: {exc}\n"
+                        "既定の再生デバイスが有効か確認してください。"
+                    ) from exc
+                logger.warning(
+                    "録音デバイスでエラーが発生しました (%s)。%.0f 秒後に再接続します...",
+                    exc,
+                    self._RETRY_WAIT_SECONDS,
+                )
+                time.sleep(self._RETRY_WAIT_SECONDS)
+
+    def _record_session(self) -> Iterator[AudioChunk]:
+        """ループバックストリームを開き、失効するまでチャンクを yield し続ける。"""
         import pyaudiowpatch as pyaudio  # Windows 専用のため遅延 import
 
+        # デバイス一覧は PyAudio インスタンスに紐づくため、
+        # 再接続のたびに作り直して最新の既定デバイスを取得する
         audio = pyaudio.PyAudio()
+        stream = None
         try:
             device = self._default_loopback(audio)
             rate = int(device["defaultSampleRate"])
@@ -130,38 +161,41 @@ class SystemAudioCapture:
                 input_device_index=int(device["index"]),
                 frames_per_buffer=self._FRAMES_PER_BUFFER,
             )
-            try:
-                reads_per_chunk = max(
-                    1,
-                    round(rate * self._config.chunk_seconds / self._FRAMES_PER_BUFFER),
+            reads_per_chunk = max(
+                1,
+                round(rate * self._config.chunk_seconds / self._FRAMES_PER_BUFFER),
+            )
+            while True:
+                logger.info("録音中 (%d 秒)...", self._config.chunk_seconds)
+                recorded_at = datetime.now()
+                frames = [
+                    stream.read(self._FRAMES_PER_BUFFER, exception_on_overflow=False)
+                    for _ in range(reads_per_chunk)
+                ]
+                yield AudioChunk(
+                    recorded_at,
+                    self._to_whisper_waveform(b"".join(frames), rate, channels),
                 )
-                while True:
-                    logger.info("録音中 (%d 秒)...", self._config.chunk_seconds)
-                    recorded_at = datetime.now()
-                    frames = [
-                        stream.read(self._FRAMES_PER_BUFFER, exception_on_overflow=False)
-                        for _ in range(reads_per_chunk)
-                    ]
-                    yield AudioChunk(
-                        recorded_at,
-                        self._to_whisper_waveform(b"".join(frames), rate, channels),
-                    )
-            finally:
-                stream.stop_stream()
-                stream.close()
         finally:
+            # ストリームが既に失効していると close も OSError を投げ、
+            # 元の例外を覆い隠してしまうため握りつぶす
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
             audio.terminate()
 
     @staticmethod
     def _default_loopback(audio) -> dict:
-        """既定の再生デバイスに対応するループバックデバイスを返す。"""
+        """既定の再生デバイスに対応するループバックデバイスを返す。
+
+        見つからない場合は OSError を送出し、呼び出し側の再接続リトライに委ねる。
+        """
         try:
             return audio.get_default_wasapi_loopback()
         except (OSError, LookupError) as exc:
-            raise SystemExit(
-                "ループバック録音デバイスが見つかりません。"
-                "既定の再生デバイスが有効か確認してください。"
-            ) from exc
+            raise OSError("ループバック録音デバイスが見つかりません") from exc
 
     def _to_whisper_waveform(
         self, data: bytes, rate: int, channels: int
@@ -267,7 +301,11 @@ class Summarizer:
 
 
 class Notifier:
-    """デスクトップ通知。通知に失敗しても本体の処理は止めない。"""
+    """デスクトップ通知。通知に失敗しても本体の処理は止めない。
+
+    Windows では plyer が使う旧来のバルーン通知が表示されないことがあるため、
+    モダンなトースト API を使う winotify を優先する。
+    """
 
     def __init__(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -276,14 +314,34 @@ class Notifier:
         if not self._enabled:
             return
         try:
-            notification.notify(
-                title=title,
-                message=message,
-                app_name="memorandum",
-                timeout=6,
-            )
+            if sys.platform == "win32":
+                self._send_windows_toast(title, message)
+            else:
+                self._send_plyer(title, message)
         except Exception:
             logger.warning("デスクトップ通知に失敗しました", exc_info=True)
+
+    @staticmethod
+    def _send_windows_toast(title: str, message: str) -> None:
+        from winotify import Notification  # Windows 専用のため遅延 import
+
+        Notification(
+            app_id="memorandum",
+            title=title,
+            msg=message,
+            duration="short",
+        ).show()
+
+    @staticmethod
+    def _send_plyer(title: str, message: str) -> None:
+        from plyer import notification
+
+        notification.notify(
+            title=title,
+            message=message,
+            app_name="memorandum",
+            timeout=6,
+        )
 
 
 def save_report(
