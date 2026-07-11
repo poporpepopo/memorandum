@@ -1,0 +1,6 @@
+# Keep launcher line endings correct regardless of the OS used to clone
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.command text eol=lf
+*.bat text eol=crlf

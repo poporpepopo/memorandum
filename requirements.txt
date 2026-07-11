@@ -1,0 +1,12 @@
+openai-whisper
+ollama
+SpeechRecognition
+plyer
+numpy
+PyAudio
+
+# Windows only: required by plyer's desktop notification backend
+pywin32; sys_platform == "win32"
+
+# Windows only: WASAPI loopback capture for --source system (web meetings)
+PyAudioWPatch; sys_platform == "win32"
