@@ -1,0 +1,27 @@
+# 純関数・キュー制御・保存処理のユニットテストを実行する。
+# Whisper (torch) / Ollama / 音声デバイスは tests/conftest.py でスタブするため、
+# CI の依存は numpy + pytest のみで軽量に保つ。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: pip install numpy pytest
+      - name: Run tests
+        run: pytest -v
