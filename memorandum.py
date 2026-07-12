@@ -31,13 +31,22 @@ import whisper
 
 logger = logging.getLogger("memorandum")
 
-# Whisper が無音時に出力しがちな定型ハルシネーション
+# Whisper が無音時に出力しがちな定型ハルシネーション。
+# 網羅リストではなく、実際の運用で観測したものを追記していくブロックリスト
 KNOWN_HALLUCINATIONS = (
     "スタッフの方が",
     "ご視聴ありがとうございました",
     "チャンネル登録",
 )
+# これ未満の文字数は無音時の断片ノイズとみなして破棄する。
+# トレードオフ: 「賛成」のような短い有効発言も落ちるが、60 秒チャンクの
+# 発言全体がこの長さに満たないケースは稀であり、ノイズ除去を優先した
 MIN_TRANSCRIPT_CHARS = 5
+
+# 未処理チャンクのキュー上限。60 秒 × 16kHz × float32 ≈ 3.8MB/チャンクのため
+# 30 件で約 115MB・遅延 30 分ぶんに相当する。推論が録音に追いつかない環境で
+# メモリが際限なく膨らむのを防ぎ、超過時は最も古い未処理チャンクを破棄する
+MAX_PENDING_CHUNKS = 30
 
 
 @dataclass(frozen=True)
@@ -52,6 +61,9 @@ class Config:
     source: str = "system" if sys.platform == "win32" else "mic"
     chunk_seconds: int = 60
     sample_rate: int = 16000
+    # 無音判定の音圧しきい値。適正値は入力デバイスのゲインに依存するため、
+    # 有効な発言がスキップされる場合はログに出る RMS 実測値を確認して
+    # --rms-threshold で調整する
     rms_threshold: float = 0.005
     output_dir: Path = Path(".")
     notify: bool = True
@@ -79,7 +91,13 @@ def rms(samples: np.ndarray) -> float:
 
 
 def resample(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-    """線形補間による簡易リサンプリング。音声認識用途では十分な品質。"""
+    """線形補間による簡易リサンプリング (追加依存なしを優先した選択)。
+
+    アンチエイリアシングフィルタを掛けないため、ダウンサンプリング時は
+    ナイキスト周波数を超える成分が折り返し雑音になり得る。認識精度への
+    影響は未計測。劣化が観測されたら scipy.signal.resample_poly 等への
+    置き換えを検討する。
+    """
     if src_rate == dst_rate:
         return samples
     n_dst = int(len(samples) * dst_rate / src_rate)
@@ -254,8 +272,8 @@ class Transcriber:
             samples,
             language=self._language,
             fp16=False,
-            no_speech_threshold=0.6,  # 無音とみなすセグメントを破棄
-            logprob_threshold=-1.0,  # 確信度の低い出力を破棄
+            no_speech_threshold=0.6,  # 無音セグメントを破棄 (Whisper の既定値を明示)
+            logprob_threshold=-1.0,  # 低確信度の出力を破棄 (Whisper の既定値を明示)
         )
         text = str(result["text"]).strip()
         return "" if self._is_hallucination(text) else text
@@ -345,12 +363,25 @@ class Notifier:
 
 
 def save_report(
-    chunks: list[TranscriptChunk], final_summary: str, output_dir: Path
+    chunks: list[TranscriptChunk],
+    final_summary: str,
+    output_dir: Path,
+    dropped_count: int = 0,
 ) -> Path:
-    """最終要約とタイムスタンプ付き全原文をテキストファイルへ保存する。"""
+    """最終要約とタイムスタンプ付き全原文をテキストファイルへ保存する。
+
+    処理しきれず破棄したチャンクがある場合は、欠落の事実をファイル冒頭に明記する。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"meeting_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
-    lines = ["=== 会議最終要約 ===", final_summary, "", "=== 全原文データ ==="]
+    lines = ["=== 会議最終要約 ===", final_summary, ""]
+    if dropped_count:
+        lines += [
+            f"⚠ 処理能力不足のため未処理のまま破棄したチャンク: {dropped_count} 件",
+            "  (該当時間帯の発言は記録されていません)",
+            "",
+        ]
+    lines += ["=== 全原文データ ==="]
     lines += [f"[{c.recorded_at:%H:%M:%S}] {c.text}" for c in chunks]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
@@ -361,6 +392,8 @@ class MeetingAssistant:
 
     録音 (メインスレッド) と文字起こし・要約 (ワーカースレッド) を
     キューで分離し、AI 処理に時間がかかっても録音が途切れないようにする。
+    キューは MAX_PENDING_CHUNKS で上限を設け、推論が録音に追いつかない
+    環境でもメモリが際限なく増えないようにする (超過時は最古チャンクを破棄)。
     """
 
     def __init__(
@@ -376,8 +409,12 @@ class MeetingAssistant:
         self._transcriber = transcriber
         self._summarizer = summarizer
         self._notifier = notifier
-        self._audio_queue: queue.Queue[AudioChunk | None] = queue.Queue()
+        self._audio_queue: queue.Queue[AudioChunk | None] = queue.Queue(
+            maxsize=MAX_PENDING_CHUNKS
+        )
         self._chunks: list[TranscriptChunk] = []
+        self._abort = threading.Event()
+        self._dropped_count = 0
 
     def run(self) -> None:
         worker = threading.Thread(
@@ -388,28 +425,92 @@ class MeetingAssistant:
             self._capture_loop()
         except KeyboardInterrupt:
             print("\n⏹ 会議を終了します。未処理の音声を処理中...")
+            print("   (もう一度 Ctrl+C で残りの処理を打ち切り、保存へ進みます)")
         finally:
-            self._audio_queue.put(None)  # ワーカーへの終了シグナル
-            worker.join()
-            self._finalize()
+            # 終了処理のどこで再度 Ctrl+C されても、文字起こし済みの内容は
+            # 必ず _finalize で保存する (議事録の全損を防ぐ)
+            try:
+                self._drain_and_join(worker)
+            except KeyboardInterrupt:
+                self._abort_and_join(worker)
+            finally:
+                self._finalize()
 
     def _capture_loop(self) -> None:
         for chunk in self._capture.chunks():
             level = rms(chunk.samples)
             if level < self._config.rms_threshold:
-                logger.info("無音のためスキップ (RMS=%.4f)", level)
+                logger.info(
+                    "無音のためスキップ (RMS=%.4f < しきい値 %.4f)",
+                    level,
+                    self._config.rms_threshold,
+                )
                 continue
-            self._audio_queue.put(chunk)
+            logger.info("音声チャンクをキューへ投入 (RMS=%.4f)", level)
+            self._enqueue(chunk)
+
+    def _enqueue(self, chunk: AudioChunk) -> None:
+        """キューへ追加する。満杯なら最も古い未処理チャンクを警告付きで破棄する。
+
+        録音 (メイン) スレッドをブロックしないことを最優先とし、議事録の
+        欠落はログで明示する。破棄は最古側: 会議の結論が出やすい直近の
+        発言を優先して残すための選択。
+        """
+        try:
+            self._audio_queue.put_nowait(chunk)
+            return
+        except queue.Full:
+            pass
+        try:
+            dropped = self._audio_queue.get_nowait()
+        except queue.Empty:  # ワーカーが直前に消化した場合
+            dropped = None
+        if isinstance(dropped, AudioChunk):
+            self._dropped_count += 1
+            logger.warning(
+                "推論が録音に追いついていません。最古の未処理チャンク"
+                " [%s] を破棄しました (累計 %d 件)。--whisper-model base"
+                " など軽いモデルの利用を検討してください。",
+                f"{dropped.recorded_at:%H:%M:%S}",
+                self._dropped_count,
+            )
+        self._audio_queue.put(chunk)
 
     def _process_loop(self) -> None:
         while True:
             chunk = self._audio_queue.get()
-            if chunk is None:
+            if chunk is None or self._abort.is_set():
                 return
             try:
                 self._process_chunk(chunk)
             except Exception:
                 logger.exception("音声チャンクの処理に失敗しました")
+
+    def _drain_and_join(self, worker: threading.Thread) -> None:
+        """未処理キューを処理し切るまで待ち、残チャンク数を定期表示する。"""
+        self._audio_queue.put(None)  # ワーカーへの終了シグナル
+        while worker.is_alive():
+            worker.join(timeout=5.0)
+            pending = self._audio_queue.qsize()
+            if worker.is_alive() and pending:
+                print(
+                    f"   残り約 {pending} チャンクを処理中..."
+                    " (もう一度 Ctrl+C で打ち切って保存へ進みます)"
+                )
+
+    def _abort_and_join(self, worker: threading.Thread) -> None:
+        """2 度目の Ctrl+C: 未処理チャンクを破棄し、処理中の 1 件だけ完了を待つ。"""
+        print("\n⏹ 残りの処理を打ち切ります。文字起こし済みの内容で議事録を保存します。")
+        self._abort.set()
+        try:
+            while True:
+                self._audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._audio_queue.put(None)
+        # Whisper / LLM の推論は途中で安全に中断できないため、
+        # 現在処理中のチャンクの完了だけは待つ (最大でも 1 チャンクぶん)
+        worker.join()
 
     def _process_chunk(self, chunk: AudioChunk) -> None:
         text = self._transcriber.transcribe(chunk.samples)
@@ -429,6 +530,9 @@ class MeetingAssistant:
         full_text = "\n".join(c.text for c in self._chunks)
         try:
             final_summary = self._summarizer.summarize_meeting(full_text)
+        except KeyboardInterrupt:
+            # 最終要約の生成中に Ctrl+C されても原文の議事録は必ず残す
+            final_summary = "(最終要約は Ctrl+C により中断されました)"
         except Exception:
             logger.exception("最終要約の生成に失敗しました。原文のみ保存します。")
             final_summary = "(最終要約の生成に失敗しました)"
@@ -438,7 +542,17 @@ class MeetingAssistant:
         print(final_summary)
         print("=" * 30)
 
-        path = save_report(self._chunks, final_summary, self._config.output_dir)
+        if self._dropped_count:
+            print(
+                f"⚠ 処理能力不足により {self._dropped_count} チャンクを破棄しました。"
+                "議事録に欠落があります。"
+            )
+        path = save_report(
+            self._chunks,
+            final_summary,
+            self._config.output_dir,
+            dropped_count=self._dropped_count,
+        )
         print(f"📄 議事録を保存しました: {path}")
         self._notifier.send("✅ 保存完了", f"議事録を保存しました: {path.name}")
 
