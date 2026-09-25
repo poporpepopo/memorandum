@@ -326,20 +326,41 @@ class TestSummarizeMeeting:
         )
         assert all(f"発言{m:03d}" in chat.prompts[0] for m in range(5))
 
+    def test_one_hour_meeting_is_summarized_in_one_call(self, fake_chat):
+        """60 分 (約 18,000 文字) の会議は分割せず、全文を 1 回で渡すこと。"""
+        chat = fake_chat()
+        Summarizer("m").summarize_meeting(_meeting(60))
+        assert len(chat.prompts) == 1
+        assert all(f"発言{m:03d}" in chat.prompts[0] for m in range(60))
+
+    def test_every_meeting_prompt_asks_to_keep_specifics(self, fake_chat):
+        """日付・金額などを落とさない指示が、全段の要約プロンプトに入っていること。"""
+        chat = fake_chat()
+        Summarizer("m").summarize_meeting(_meeting(180))
+        # 定数そのものではなく文言で確かめる (定数を空にされても気づけるように)
+        assert all(
+            "日付・金額・数量・担当者" in p and "省略せず" in p for p in chat.prompts
+        )
+
     def test_context_length_is_always_explicit(self, fake_chat):
         """num_ctx を渡さないと Ollama の既定 (4K) で切り捨てられるため、毎回明示すること。"""
         chat = fake_chat()
         summarizer = Summarizer("m")
         summarizer.summarize_chunk("直近の発言です。")
-        summarizer.summarize_meeting(_meeting(60))
+        summarizer.summarize_meeting(_meeting(180))
         assert chat.options and all(
-            o == {"num_ctx": memorandum.LLM_NUM_CTX} for o in chat.options
+            o
+            == {
+                "num_ctx": memorandum.LLM_NUM_CTX,
+                "num_predict": memorandum.LLM_MAX_OUTPUT_TOKENS,
+            }
+            for o in chat.options
         )
 
     def test_long_meeting_never_exceeds_budget(self, fake_chat):
-        """1 時間の会議でも、1 回に渡す量が予算を超えないこと (= 前半が切り捨てられない)。"""
+        """3 時間の会議でも、1 回に渡す量が予算を超えないこと (= 前半が切り捨てられない)。"""
         chat = fake_chat()
-        Summarizer("m").summarize_meeting(_meeting(60))
+        Summarizer("m").summarize_meeting(_meeting(180))
         assert len(chat.prompts) > 1
         assert all(
             len(p) <= SUMMARY_BLOCK_CHARS + PROMPT_OVERHEAD for p in chat.prompts
@@ -348,9 +369,9 @@ class TestSummarizeMeeting:
     def test_long_meeting_covers_every_minute_exactly_once(self, fake_chat):
         """段階要約の最初の段で、全ての発言がちょうど 1 回ずつ LLM に渡ること。"""
         chat = fake_chat()
-        Summarizer("m").summarize_meeting(_meeting(60))
+        Summarizer("m").summarize_meeting(_meeting(180))
         sections = [p for p in chat.prompts if p.startswith("以下は会議の一部")]
-        for m in range(60):
+        for m in range(180):
             assert sum(f"発言{m:03d}" in p for p in sections) == 1
         assert chat.prompts[-1].startswith(
             "あなたはプロの書記です。以下は会議を時間帯ごとに"
@@ -358,37 +379,39 @@ class TestSummarizeMeeting:
 
     def test_sections_are_labelled_with_their_time_span(self, fake_chat):
         chat = fake_chat()
-        Summarizer("m").summarize_meeting(_meeting(60))
+        Summarizer("m").summarize_meeting(_meeting(180))
         assert "（14:00〜" in chat.prompts[0]
-        assert "〜14:59】" in chat.prompts[-1]
+        assert "〜16:59】" in chat.prompts[-1]
 
     def test_oversized_single_chunk_is_split_without_loss(self):
         """1 チャンクだけで予算を超えても、切り詰めずに刻むこと。"""
-        text = "".join(f"{i:05d}" for i in range(2000))  # 10000 文字
+        text = "".join(f"{i:05d}" for i in range(12000))  # 60000 文字
         excerpts = to_excerpts([TranscriptChunk(_at(0), text)], SUMMARY_BLOCK_CHARS)
         assert "".join(e.text for e in excerpts) == text
         assert all(e.size <= SUMMARY_BLOCK_CHARS for e in excerpts)
 
     def test_oversized_single_chunk_stays_within_budget(self, fake_chat):
         chat = fake_chat()
-        Summarizer("m").summarize_meeting([TranscriptChunk(_at(0), "あ" * 10000)])
+        Summarizer("m").summarize_meeting([TranscriptChunk(_at(0), "あ" * 60000)])
         sections = [p for p in chat.prompts if p.startswith("以下は会議の一部")]
-        assert len(sections) == 4
+        assert len(sections) == 3
         assert all(
             len(p) <= SUMMARY_BLOCK_CHARS + PROMPT_OVERHEAD for p in chat.prompts
         )
 
     def test_oversized_note_does_not_break_budget(self, fake_chat):
         """LLM が区間メモを予算より長く返しても、次の段の入力が予算を超えないこと。"""
-        chat = fake_chat(reply=lambda prompt: "長" * 5000)
-        Summarizer("m").summarize_meeting(_meeting(60))
+        chat = fake_chat(reply=lambda prompt: "長" * 30000)
+        Summarizer("m").summarize_meeting(_meeting(180))
         assert all(
             len(p) <= SUMMARY_BLOCK_CHARS + PROMPT_OVERHEAD for p in chat.prompts
         )
 
     def test_terminates_when_llm_ignores_length_limit(self, fake_chat):
         """LLM が文字数の指示を無視して長く返しても、有限回で終わり予算内に収まること。"""
-        chat = fake_chat(reply=lambda prompt: "長い" * 1000)
+        chat = fake_chat(
+            reply=lambda prompt: "長" * 13000
+        )  # 2 つ並ぶと予算を超える長さ
         Summarizer("m").summarize_meeting(_meeting(180))
         assert len(chat.prompts) < 200
         assert len(chat.prompts[-1]) <= SUMMARY_BLOCK_CHARS + PROMPT_OVERHEAD
