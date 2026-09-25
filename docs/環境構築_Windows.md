@@ -62,8 +62,8 @@ venv 作成と依存インストールも自動で行います）。
 .\venv\Scripts\python memorandum.py --help
 ```
 
-`Ctrl+C` で終了すると、最終要約付きの議事録
-`meeting_log_YYYYMMDD_HHMMSS.txt` が保存されます。
+原文は録音中から `meeting_log_YYYYMMDD_HHMMSS.txt` に随時追記され、
+`Ctrl+C` で終了すると最終要約付きの議事録に置き換わります。
 
 ## 3. 実行時の確認事項
 
