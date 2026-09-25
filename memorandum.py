@@ -38,7 +38,6 @@ logger = logging.getLogger("memorandum")
 # Whisper が無音時に出力しがちな定型ハルシネーション。
 # 網羅リストではなく、実際の運用で観測したものを追記していくブロックリスト
 KNOWN_HALLUCINATIONS = (
-    "スタッフの方が",
     "ご視聴ありがとうございました",
     "チャンネル登録",
 )
