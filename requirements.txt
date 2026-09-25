@@ -1,7 +1,6 @@
 openai-whisper
 ollama
 SpeechRecognition
-plyer
 numpy
 PyAudio
 

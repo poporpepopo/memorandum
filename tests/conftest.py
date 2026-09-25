@@ -19,7 +19,6 @@ for _name, _module in {
     "whisper": MagicMock(),
     "ollama": _ollama_stub,
     "speech_recognition": MagicMock(),
-    "plyer": MagicMock(),
     "winotify": MagicMock(),
 }.items():
     sys.modules[_name] = _module
